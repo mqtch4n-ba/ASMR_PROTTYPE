@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Web ASMR Studio Pro</title>
     <style>
-        :root { --primary: #007bff; --danger: #dc3545; --bg: #121212; --panel: #1e1e1e; }
+        :root { --primary: #007bff; --success: #28a745; --danger: #dc3545; --bg: #121212; --panel: #1e1e1e; }
         body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: white; display: flex; flex-direction: column; align-items: center; padding: 20px; margin: 0; }
         .container { background: var(--panel); padding: 30px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); width: 100%; max-width: 500px; }
         h1 { text-align: center; font-size: 1.5rem; margin-bottom: 20px; color: var(--primary); }
@@ -13,13 +13,17 @@
         label { display: block; font-size: 0.85rem; margin-bottom: 8px; color: #aaa; }
         .btn-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 10px; }
         button { padding: 12px; border-radius: 8px; border: none; cursor: pointer; font-weight: bold; transition: 0.2s; background: #444; color: white; }
-        button:hover { opacity: 0.9; transform: translateY(-1px); }
+        button:hover:not(:disabled) { opacity: 0.9; transform: translateY(-1px); }
         button.active { background: var(--primary); }
-        #recordBtn { width: 100%; background: var(--primary); font-size: 1.1rem; margin-top: 10px; }
-        #stopBtn { width: 100%; background: var(--danger); font-size: 1.1rem; display: none; margin-top: 10px; }
+        button:disabled { opacity: 0.3; cursor: not-allowed; }
+        
+        .main-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+        #previewBtn { background: var(--primary); }
+        #recordBtn { background: var(--success); }
+        #stopBtn { background: var(--danger); grid-column: span 2; display: none; }
+        
         input[type="range"] { width: 100%; cursor: pointer; }
         .status { text-align: center; margin-top: 15px; font-weight: bold; color: #00ffcc; font-family: monospace; }
-        canvas { background: #000; border-radius: 10px; width: 100%; height: 60px; margin-top: 10px; }
     </style>
 </head>
 <body>
@@ -47,19 +51,23 @@
         <input type="range" id="toneLevel" min="-20" max="20" value="0">
     </div>
 
-    <button id="recordBtn">録音開始</button>
-    <button id="stopBtn">停止して保存</button>
+    <div class="main-actions">
+        <button id="previewBtn">プレビュー開始</button>
+        <button id="recordBtn" disabled>録音開始</button>
+        <button id="stopBtn">停止 (保存して終了)</button>
+    </div>
     
     <div class="status" id="statusText">READY</div>
-    <canvas id="visualizer"></canvas>
 </div>
 
 <script>
     let audioCtx, source, filter, compressor, delayNode, feedbackGain, wetGain, panner, dest, mediaRecorder;
     let chunks = [];
     let angle = 0;
+    let isRecording = false;
 
-    const startBtn = document.getElementById('recordBtn');
+    const previewBtn = document.getElementById('previewBtn');
+    const recordBtn = document.getElementById('recordBtn');
     const stopBtn = document.getElementById('stopBtn');
     const statusText = document.getElementById('statusText');
     const swingSpeed = document.getElementById('swingSpeed');
@@ -67,92 +75,86 @@
     const echoLevel = document.getElementById('echoLevel');
     const toneLevel = document.getElementById('toneLevel');
 
-    // UIイベント：パンニングボタン
-    document.getElementById('panL').onclick = () => { manualPan.value = -1; swingSpeed.value = 0; updateBtnState('panL'); };
-    document.getElementById('panC').onclick = () => { manualPan.value = 0; swingSpeed.value = 0; updateBtnState('panC'); };
-    document.getElementById('panR').onclick = () => { manualPan.value = 1; swingSpeed.value = 0; updateBtnState('panR'); };
-
-    function updateBtnState(id) {
-        ['panL', 'panC', 'panR'].forEach(btnId => {
-            document.getElementById(btnId).classList.toggle('active', btnId === id);
+    // --- 1. オーディオエンジン(接続)の初期化 ---
+    async function initAudio() {
+        if (audioCtx) return;
+        
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+            audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } 
         });
+
+        source = audioCtx.createMediaStreamSource(stream);
+        filter = audioCtx.createBiquadFilter();
+        filter.type = 'lowshelf'; 
+        compressor = audioCtx.createDynamicsCompressor();
+        delayNode = audioCtx.createDelay();
+        delayNode.delayTime.value = 0.3; 
+        feedbackGain = audioCtx.createGain();
+        wetGain = audioCtx.createGain();
+        wetGain.gain.value = 0; 
+        panner = audioCtx.createStereoPanner();
+        dest = audioCtx.createMediaStreamDestination();
+
+        // 接続
+        delayNode.connect(feedbackGain).connect(delayNode).connect(wetGain);
+        source.connect(filter).connect(compressor);
+        compressor.connect(panner); // 直音
+        compressor.connect(delayNode); // エコー用
+        wetGain.connect(panner);    // エコー出力
+        panner.connect(audioCtx.destination); // モニター出力
+        panner.connect(dest); // 録音用出力
+
+        updateLoop();
     }
 
-    startBtn.onclick = async () => {
-        try {
-            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            const stream = await navigator.mediaDevices.getUserMedia({ 
-                audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } 
-            });
+    // --- 2. プレビュー開始 ---
+    previewBtn.onclick = async () => {
+        await initAudio();
+        statusText.innerText = "● PREVIEWING (Monitoring)";
+        previewBtn.disabled = true;
+        recordBtn.disabled = false;
+        stopBtn.style.display = 'block';
+    };
 
-            source = audioCtx.createMediaStreamSource(stream);
+    // --- 3. 録音開始 ---
+    recordBtn.onclick = () => {
+        if (!dest) return;
+        mediaRecorder = new MediaRecorder(dest.stream, { mimeType: 'audio/webm' });
+        chunks = [];
+        mediaRecorder.ondataavailable = e => chunks.push(e.data);
+        mediaRecorder.onstop = () => {
+            const blob = new Blob(chunks, { type: 'audio/webm' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.download = `asmr_pro_${Date.now()}.webm`;
+            a.href = url; a.click();
+        };
 
-            // 1. フィルター & コンプレッサー
-            filter = audioCtx.createBiquadFilter();
-            filter.type = 'lowshelf'; 
-            compressor = audioCtx.createDynamicsCompressor();
+        mediaRecorder.start();
+        isRecording = true;
+        statusText.innerText = "● RECORDING...";
+        recordBtn.disabled = true;
+    };
 
-            // 2. エコー（ディレイ）ユニット
-            delayNode = audioCtx.createDelay();
-            delayNode.delayTime.value = 0.3; 
-            feedbackGain = audioCtx.createGain(); // 繰り返しの強さ
-            wetGain = audioCtx.createGain();      // エコーの音量そのもの
-            wetGain.gain.value = 0; 
-
-            // エコーループ接続
-            delayNode.connect(feedbackGain);
-            feedbackGain.connect(delayNode);
-            delayNode.connect(wetGain);
-
-            // 3. パンナー
-            panner = audioCtx.createStereoPanner();
-
-            // 4. 出力先
-            dest = audioCtx.createMediaStreamDestination();
-
-            /* --- 接続ロジック ---
-               Source -> Filter -> Compressor
-               Compressor -> Panner (ドライ音：加工済み生音)
-               Compressor -> Delay -> WetGain -> Panner (ウェット音：エコー)
-               Panner -> Destination (モニタリング & 録音)
-            */
-            source.connect(filter);
-            filter.connect(compressor);
-            
-            compressor.connect(panner); // 直音
-            compressor.connect(delayNode); // エコーの入力
-            wetGain.connect(panner);    // エコーの出力
-
-            panner.connect(audioCtx.destination);
-            panner.connect(dest);
-
-            // 録音セットアップ
-            mediaRecorder = new MediaRecorder(dest.stream, { mimeType: 'audio/webm' });
-            chunks = [];
-            mediaRecorder.ondataavailable = e => chunks.push(e.data);
-            mediaRecorder.onstop = () => {
-                const blob = new Blob(chunks, { type: 'audio/webm' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.download = `asmr_pro_${Date.now()}.webm`;
-                a.href = url; a.click();
-            };
-
-            mediaRecorder.start();
-            updateLoop();
-
-            startBtn.style.display = 'none';
-            stopBtn.style.display = 'block';
-            statusText.innerText = "● RECORDING...";
-        } catch (e) {
-            alert("マイクへのアクセスを許可してください。");
+    // --- 4. 停止処理 ---
+    stopBtn.onclick = () => {
+        if (isRecording && mediaRecorder) {
+            mediaRecorder.stop();
         }
+        if (audioCtx) {
+            audioCtx.close();
+            audioCtx = null;
+        }
+        isRecording = false;
+        previewBtn.disabled = false;
+        recordBtn.disabled = true;
+        stopBtn.style.display = 'none';
+        statusText.innerText = "READY";
     };
 
     function updateLoop() {
         if (!audioCtx) return;
-
-        // パンニング：自動スイングか手動か
         const speed = parseFloat(swingSpeed.value) / 1000;
         if (speed > 0) {
             angle += speed;
@@ -161,27 +163,21 @@
         } else {
             panner.pan.value = parseFloat(manualPan.value);
         }
-
-        // エコー：音量とフィードバックの同期
         const echoVal = parseFloat(echoLevel.value) / 100;
-        wetGain.gain.value = echoVal; // エコー音の音量
-        feedbackGain.gain.value = echoVal * 0.7; // 繰り返しの減衰率
-
-        // トーン：低域のゲイン調整
+        wetGain.gain.value = echoVal;
+        feedbackGain.gain.value = echoVal * 0.7;
         filter.frequency.value = 800;
         filter.gain.value = parseFloat(toneLevel.value);
-
         requestAnimationFrame(updateLoop);
     }
 
-    stopBtn.onclick = () => {
-        if (mediaRecorder) mediaRecorder.stop();
-        if (audioCtx) audioCtx.close();
-        audioCtx = null;
-        startBtn.style.display = 'block';
-        stopBtn.style.display = 'none';
-        statusText.innerText = "SAVED";
-    };
+    // パン設定ボタン
+    document.getElementById('panL').onclick = () => { manualPan.value = -1; swingSpeed.value = 0; updateBtnState('panL'); };
+    document.getElementById('panC').onclick = () => { manualPan.value = 0; swingSpeed.value = 0; updateBtnState('panC'); };
+    document.getElementById('panR').onclick = () => { manualPan.value = 1; swingSpeed.value = 0; updateBtnState('panR'); };
+    function updateBtnState(id) {
+        ['panL', 'panC', 'panR'].forEach(btnId => document.getElementById(btnId).classList.toggle('active', btnId === id));
+    }
 </script>
 </body>
 </html>
