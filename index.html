@@ -9,18 +9,14 @@
         body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: white; display: flex; flex-direction: column; align-items: center; padding: 20px; margin: 0; }
         .container { background: var(--panel); padding: 30px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); width: 100%; max-width: 500px; }
         h1 { text-align: center; font-size: 1.5rem; margin-bottom: 20px; color: var(--primary); }
-        
         .control-group { background: #2a2a2a; padding: 15px; border-radius: 12px; margin-bottom: 15px; }
         label { display: block; font-size: 0.85rem; margin-bottom: 8px; color: #aaa; }
-        
         .btn-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 10px; }
         button { padding: 12px; border-radius: 8px; border: none; cursor: pointer; font-weight: bold; transition: 0.2s; background: #444; color: white; }
         button:hover { opacity: 0.9; transform: translateY(-1px); }
         button.active { background: var(--primary); }
-        
         #recordBtn { width: 100%; background: var(--primary); font-size: 1.1rem; margin-top: 10px; }
         #stopBtn { width: 100%; background: var(--danger); font-size: 1.1rem; display: none; margin-top: 10px; }
-        
         input[type="range"] { width: 100%; cursor: pointer; }
         .status { text-align: center; margin-top: 15px; font-weight: bold; color: #00ffcc; font-family: monospace; }
         canvas { background: #000; border-radius: 10px; width: 100%; height: 60px; margin-top: 10px; }
@@ -32,20 +28,21 @@
     <h1>ASMR Studio Pro</h1>
 
     <div class="control-group">
-        <label>左右パンニング設定</label>
+        <label>左右位置 (L ←→ R)</label>
         <div class="btn-grid">
             <button id="panL">左固定</button>
             <button id="panC" class="active">中央</button>
             <button id="panR">右固定</button>
         </div>
-        <label>オートスイング速度</label>
+        <label>自動スイング速度</label>
         <input type="range" id="swingSpeed" min="0" max="100" value="0">
+        <label>マニュアル・パン</label>
         <input type="range" id="manualPan" min="-1" max="1" step="0.1" value="0">
     </div>
 
     <div class="control-group">
-        <label>エコー (Delay)</label>
-        <input type="range" id="echoLevel" min="0" max="80" value="0">
+        <label>エコー (Echo Level)</label>
+        <input type="range" id="echoLevel" min="0" max="100" value="0">
         <label>トーン (低音 ←→ 高音)</label>
         <input type="range" id="toneLevel" min="-20" max="20" value="0">
     </div>
@@ -58,9 +55,8 @@
 </div>
 
 <script>
-    let audioCtx, source, filter, compressor, delayNode, feedbackGain, panner, dest, mediaRecorder;
+    let audioCtx, source, filter, compressor, delayNode, feedbackGain, wetGain, panner, dest, mediaRecorder;
     let chunks = [];
-    let isAutoSwing = false;
     let angle = 0;
 
     const startBtn = document.getElementById('recordBtn');
@@ -71,79 +67,92 @@
     const echoLevel = document.getElementById('echoLevel');
     const toneLevel = document.getElementById('toneLevel');
 
-    // UIイベント
-    document.getElementById('panL').onclick = () => { manualPan.value = -1; swingSpeed.value = 0; };
-    document.getElementById('panC').onclick = () => { manualPan.value = 0; swingSpeed.value = 0; };
-    document.getElementById('panR').onclick = () => { manualPan.value = 1; swingSpeed.value = 0; };
+    // UIイベント：パンニングボタン
+    document.getElementById('panL').onclick = () => { manualPan.value = -1; swingSpeed.value = 0; updateBtnState('panL'); };
+    document.getElementById('panC').onclick = () => { manualPan.value = 0; swingSpeed.value = 0; updateBtnState('panC'); };
+    document.getElementById('panR').onclick = () => { manualPan.value = 1; swingSpeed.value = 0; updateBtnState('panR'); };
+
+    function updateBtnState(id) {
+        ['panL', 'panC', 'panR'].forEach(btnId => {
+            document.getElementById(btnId).classList.toggle('active', btnId === id);
+        });
+    }
 
     startBtn.onclick = async () => {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const stream = await navigator.mediaDevices.getUserMedia({ 
-            audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } 
-        });
+        try {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const stream = await navigator.mediaDevices.getUserMedia({ 
+                audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } 
+            });
 
-        source = audioCtx.createMediaStreamSource(stream);
+            source = audioCtx.createMediaStreamSource(stream);
 
-        // 1. 基本フィルター
-        filter = audioCtx.createBiquadFilter();
-        filter.type = 'lowshelf'; // トーン調整用
+            // 1. フィルター & コンプレッサー
+            filter = audioCtx.createBiquadFilter();
+            filter.type = 'lowshelf'; 
+            compressor = audioCtx.createDynamicsCompressor();
 
-        // 2. コンプレッサー
-        compressor = audioCtx.createDynamicsCompressor();
+            // 2. エコー（ディレイ）ユニット
+            delayNode = audioCtx.createDelay();
+            delayNode.delayTime.value = 0.3; 
+            feedbackGain = audioCtx.createGain(); // 繰り返しの強さ
+            wetGain = audioCtx.createGain();      // エコーの音量そのもの
+            wetGain.gain.value = 0; 
 
-        // 3. エコー (Delay) ユニット
-        delayNode = audioCtx.createDelay();
-        delayNode.delayTime.value = 0.3;
-        feedbackGain = audioCtx.createGain();
-        feedbackGain.gain.value = 0; // 初期値0
+            // エコーループ接続
+            delayNode.connect(feedbackGain);
+            feedbackGain.connect(delayNode);
+            delayNode.connect(wetGain);
 
-        // エコーループ接続
-        delayNode.connect(feedbackGain);
-        feedbackGain.connect(delayNode);
+            // 3. パンナー
+            panner = audioCtx.createStereoPanner();
 
-        // 4. パンナー (StereoPannerを使用)
-        panner = audioCtx.createStereoPanner();
+            // 4. 出力先
+            dest = audioCtx.createMediaStreamDestination();
 
-        // 5. 出力と録音
-        dest = audioCtx.createMediaStreamDestination();
+            /* --- 接続ロジック ---
+               Source -> Filter -> Compressor
+               Compressor -> Panner (ドライ音：加工済み生音)
+               Compressor -> Delay -> WetGain -> Panner (ウェット音：エコー)
+               Panner -> Destination (モニタリング & 録音)
+            */
+            source.connect(filter);
+            filter.connect(compressor);
+            
+            compressor.connect(panner); // 直音
+            compressor.connect(delayNode); // エコーの入力
+            wetGain.connect(panner);    // エコーの出力
 
-        // 全体接続
-        source.connect(filter);
-        filter.connect(compressor);
-        
-        // メインパス
-        compressor.connect(panner);
-        // エコーパス (ウェット音)
-        compressor.connect(delayNode);
-        delayNode.connect(panner);
+            panner.connect(audioCtx.destination);
+            panner.connect(dest);
 
-        panner.connect(audioCtx.destination);
-        panner.connect(dest);
+            // 録音セットアップ
+            mediaRecorder = new MediaRecorder(dest.stream, { mimeType: 'audio/webm' });
+            chunks = [];
+            mediaRecorder.ondataavailable = e => chunks.push(e.data);
+            mediaRecorder.onstop = () => {
+                const blob = new Blob(chunks, { type: 'audio/webm' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.download = `asmr_pro_${Date.now()}.webm`;
+                a.href = url; a.click();
+            };
 
-        // 録音
-        mediaRecorder = new MediaRecorder(dest.stream);
-        chunks = [];
-        mediaRecorder.ondataavailable = e => chunks.push(e.data);
-        mediaRecorder.onstop = () => {
-            const blob = new Blob(chunks, { type: 'audio/webm' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.download = `asmr_pro_${Date.now()}.webm`;
-            a.href = url; a.click();
-        };
+            mediaRecorder.start();
+            updateLoop();
 
-        mediaRecorder.start();
-        updateLoop();
-
-        startBtn.style.display = 'none';
-        stopBtn.style.display = 'block';
-        statusText.innerText = "● RECORDING";
+            startBtn.style.display = 'none';
+            stopBtn.style.display = 'block';
+            statusText.innerText = "● RECORDING...";
+        } catch (e) {
+            alert("マイクへのアクセスを許可してください。");
+        }
     };
 
     function updateLoop() {
         if (!audioCtx) return;
 
-        // パンニング処理
+        // パンニング：自動スイングか手動か
         const speed = parseFloat(swingSpeed.value) / 1000;
         if (speed > 0) {
             angle += speed;
@@ -153,20 +162,21 @@
             panner.pan.value = parseFloat(manualPan.value);
         }
 
-        // エコー処理 (フィードバック量)
-        feedbackGain.gain.value = parseFloat(echoLevel.value) / 100;
+        // エコー：音量とフィードバックの同期
+        const echoVal = parseFloat(echoLevel.value) / 100;
+        wetGain.gain.value = echoVal; // エコー音の音量
+        feedbackGain.gain.value = echoVal * 0.7; // 繰り返しの減衰率
 
-        // トーン処理 (低音・高音)
-        const tone = parseFloat(toneLevel.value);
-        filter.frequency.value = 1000;
-        filter.gain.value = tone;
+        // トーン：低域のゲイン調整
+        filter.frequency.value = 800;
+        filter.gain.value = parseFloat(toneLevel.value);
 
         requestAnimationFrame(updateLoop);
     }
 
     stopBtn.onclick = () => {
-        mediaRecorder.stop();
-        audioCtx.close();
+        if (mediaRecorder) mediaRecorder.stop();
+        if (audioCtx) audioCtx.close();
         audioCtx = null;
         startBtn.style.display = 'block';
         stopBtn.style.display = 'none';
